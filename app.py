@@ -487,12 +487,107 @@ def _walk_forward_weights(seq, bandit):
     return {name: weights[name] / total for name in weights}
 
 
-def calculate_final(seq, session_id, state):
-    """Ensemble thích nghi cho Tài/Xỉu trên tối đa 200 phiên.
+def _raw_ensemble_probability(seq, weights):
+    """Tính xác suất ensemble trước calibration.
 
-    Giữ Bayesian + HMM + Bandit + entropy/regime; MD5 đã bỏ.
-    Markov là thuật toán bổ sung. Trọng số được học bằng walk-forward,
-    nên không mặc định thiên Tài hay Xỉu.
+    Hàm này cố ý KHÔNG dùng kết quả tương lai. Nó được dùng cho
+    walk-forward calibration để phát hiện ensemble có bị lệch Tài/Xỉu
+    một cách hệ thống hay không.
+    """
+    probs = _expert_probabilities(seq)
+    p = sum(probs[name] * weights.get(name, 0.0) for name in probs)
+
+    n = len(seq)
+    if n >= 2:
+        last = seq[-1]
+        streak = 1
+        while streak < n and seq[-1 - streak] == last:
+            streak += 1
+
+        # Chỉ dùng streak nếu lịch sử cùng streak có đủ mẫu.
+        if streak >= 3:
+            hits = total = 0
+            for i in range(streak, n):
+                if seq[i-streak:i] == [last] * streak:
+                    total += 1
+                    hits += seq[i]
+            if total >= 3:
+                streak_p = (hits + 2.0) / (total + 4.0)
+                p = 0.82 * p + 0.18 * streak_p
+
+    return clamp(p, 0.05, 0.95)
+
+
+def _walk_forward_calibration(seq, weights, max_points=80):
+    """Đo và sửa bias Tài/Xỉu của chính ensemble.
+
+    Nếu trong các lần dự báo quá khứ ensemble thường cho 65-75% Tài nhưng
+    kết quả thật chỉ khoảng 50%, chỉ tăng/giảm một phía sẽ không đủ. Vì vậy
+    calibration học sai số signed (actual - predicted) và thêm một bộ lọc
+    riêng cho directional bias.
+    """
+    n = len(seq)
+    if n < 30:
+        return {
+            "offset": 0.0,
+            "predicted_tai_rate": 0.5,
+            "actual_tai_rate": sum(seq) / n if n else 0.5,
+            "direction_bias": 0.0,
+            "samples": 0,
+        }
+
+    start = max(12, n - max_points)
+    preds = []
+    actuals = []
+
+    for i in range(start, n):
+        prefix = seq[:i]
+        if len(prefix) < 12:
+            continue
+        preds.append(_raw_ensemble_probability(prefix, weights))
+        actuals.append(seq[i])
+
+    if not preds:
+        return {
+            "offset": 0.0,
+            "predicted_tai_rate": 0.5,
+            "actual_tai_rate": 0.5,
+            "direction_bias": 0.0,
+            "samples": 0,
+        }
+
+    # Weighted recent error: phiên gần đây quan trọng hơn.
+    sw = 0.0
+    signed = 0.0
+    for j, (pred, actual) in enumerate(zip(preds, actuals)):
+        w = 0.985 ** (len(preds) - 1 - j)
+        signed += w * (actual - pred)
+        sw += w
+
+    offset = signed / sw if sw else 0.0
+    predicted_rate = sum(preds) / len(preds)
+    actual_rate = sum(actuals) / len(actuals)
+
+    # Directional bias: tỷ lệ dự đoán Tài (p >= 0.5) so với tỷ lệ Tài thật.
+    predicted_tai_rate = sum(p >= 0.5 for p in preds) / len(preds)
+    direction_bias = actual_rate - predicted_tai_rate
+
+    return {
+        "offset": clamp(offset, -0.18, 0.18),
+        "predicted_tai_rate": predicted_rate,
+        "actual_tai_rate": actual_rate,
+        "direction_bias": clamp(direction_bias, -0.30, 0.30),
+        "samples": len(preds),
+    }
+
+
+def calculate_final(seq, session_id, state):
+    """Ensemble Tài/Xỉu trên tối đa 200 phiên.
+
+    Giữ nguyên 4 nhóm thuật toán hiện có và Markov thay MD5. Điểm quan trọng
+    của bản này là calibration walk-forward: nếu engine có xu hướng chọn Tài
+    quá nhiều trong dữ liệu thực tế, xác suất hiện tại sẽ được kéo lại đối
+    xứng về phía Xỉu. Không ép 50/50 và không giả định phiên kế tiếp phải đảo.
     """
     del session_id
 
@@ -514,7 +609,6 @@ def calculate_final(seq, session_id, state):
     # --------------------------------------------------------
     # BASE RATE ĐỐI XỨNG
     # --------------------------------------------------------
-    # Chỉ là prior yếu. Không cho tỷ lệ Tài cũ kéo xác suất về Tài mãi.
     recent_n = min(24, n)
     mid_n = min(80, n)
     recent_rate = sum(seq[-recent_n:]) / recent_n
@@ -522,65 +616,90 @@ def calculate_final(seq, session_id, state):
     global_rate = sum(seq) / n
 
     base_rate = 0.50 * recent_rate + 0.30 * mid_rate + 0.20 * global_rate
-    # Shrink mạnh về 50%, đặc biệt quan trọng khi 200 phiên có lệch ngẫu nhiên.
-    base_rate = 0.50 + (base_rate - 0.50) * 0.35
+    base_rate = 0.50 + (base_rate - 0.50) * 0.25
 
     # --------------------------------------------------------
     # RUN/STREAK CHECK
     # --------------------------------------------------------
-    # Không mặc định "bệt thì tiếp tục". Kiểm tra lịch sử các vị trí có
-    # cùng streak và xem cửa tiếp theo thực sự là gì.
     last = seq[-1]
     streak = 1
     while streak < n and seq[-1 - streak] == last:
         streak += 1
 
     streak_p = 0.50
+    streak_samples = 0
     if streak >= 2:
         hits = total = 0
         for i in range(streak, n):
             if seq[i-streak:i] == [last] * streak:
                 total += 1
                 hits += seq[i]
+        streak_samples = total
         if total:
             streak_p = (hits + 2.0) / (total + 4.0)
 
-    # Khi streak dài nhưng lịch sử không ủng hộ tiếp diễn, giảm p tương ứng.
-    if streak >= 3:
-        p_model = 0.72 * p_model + 0.28 * streak_p
+    # Streak dài không được mặc định là tiếp tục.
+    if streak >= 3 and streak_samples >= 3:
+        p_model = 0.80 * p_model + 0.20 * streak_p
 
     # --------------------------------------------------------
-    # LOGIT BLEND - Đối xứng quanh 50%
+    # WALK-FORWARD ANTI-BIAS CALIBRATION
+    # --------------------------------------------------------
+    calibration = _walk_forward_calibration(seq, weights)
+
+    # Offset signed là correction chính.
+    p_cal = p_model + 0.72 * calibration["offset"]
+
+    # Nếu engine historically chọn Tài quá thường xuyên so với kết quả thật,
+    # thêm correction directional nhỏ. Làm hoàn toàn đối xứng cho Xỉu.
+    directional_gap = calibration["direction_bias"]
+    p_cal += 0.28 * directional_gap
+
+    # Không cho base-rate kéo quá mạnh về phía nào.
+    p_cal = 0.82 * p_cal + 0.18 * base_rate
+    p_cal = clamp(p_cal, 0.04, 0.96)
+
+    # --------------------------------------------------------
+    # LOGIT BLEND + SHRINK
     # --------------------------------------------------------
     def logit(p):
         p = clamp(p, 0.03, 0.97)
         return math.log(p / (1.0 - p))
 
-    # Model là nguồn chính; base-rate chỉ 20%.
-    blended_logit = 0.80 * logit(p_model) + 0.20 * logit(base_rate)
-    p = sigmoid(blended_logit)
+    p = sigmoid(logit(p_cal))
 
-    # Khi dữ liệu ngắn, co xác suất về 50%.
     if n < 20:
-        shrink = 0.60
+        shrink = 0.55
     elif n < 40:
-        shrink = 0.78
+        shrink = 0.75
     else:
-        shrink = 0.90
+        shrink = 0.92
     p = 0.50 + (p - 0.50) * shrink
 
-    # Entropy/regime chỉ giảm độ tự tin, không đẩy về Tài/Xỉu.
+    # Entropy/regime chỉ giảm confidence, tuyệt đối không đổi hướng.
     caution = chaos_block(seq)
     if caution:
-        p = 0.50 + (p - 0.50) * 0.55
+        p = 0.50 + (p - 0.50) * 0.50
 
-    # Nếu các expert bất đồng mạnh, giảm độ tự tin.
     disagreement = max(probs.values()) - min(probs.values())
     if disagreement > 0.38:
-        p = 0.50 + (p - 0.50) * 0.72
+        p = 0.50 + (p - 0.50) * 0.68
+
+    # --------------------------------------------------------
+    # DIRECTIONAL GUARD
+    # --------------------------------------------------------
+    # Nếu engine đang dự đoán một phía quá thường xuyên nhưng historical
+    # calibration chứng minh phía đó không có lợi thế, kéo thêm một chút.
+    # Guard chỉ kích hoạt khi có >= 30 mẫu, tránh phản ứng với ít dữ liệu.
+    if calibration["samples"] >= 30:
+        pred_rate = calibration["predicted_tai_rate"]
+        actual_rate = calibration["actual_tai_rate"]
+        gap = pred_rate - actual_rate
+        if abs(gap) >= 0.10:
+            p -= 0.20 * gap
 
     # Cap đối xứng.
-    max_conf = 0.80 if caution else 0.84
+    max_conf = 0.78 if caution else 0.84
     p = clamp(p, 1.0 - max_conf, max_conf)
 
     final = "TÀI" if p >= 0.5 else "XỈU"
@@ -603,8 +722,14 @@ def calculate_final(seq, session_id, state):
         "mid_tai_rate": round(mid_rate * 100.0, 2),
         "global_tai_rate": round(global_rate * 100.0, 2),
         "calibration_base_tai": round(base_rate * 100.0, 2),
+        "calibration_offset": round(calibration["offset"] * 100.0, 2),
+        "calibration_predicted_tai_rate": round(calibration["predicted_tai_rate"] * 100.0, 2),
+        "calibration_actual_tai_rate": round(calibration["actual_tai_rate"] * 100.0, 2),
+        "calibration_direction_bias": round(calibration["direction_bias"] * 100.0, 2),
+        "calibration_samples": calibration["samples"],
         "streak": streak,
         "streak_probability_tai": round(streak_p * 100.0, 2),
+        "streak_samples": streak_samples,
         "expert_disagreement": round(disagreement, 6),
         "entropy": round(entropy(seq, min(30, max(20, len(seq)))) if len(seq) >= 20 else 0.0, 6),
         "regime_strength": round(regime_strength(seq), 6),
