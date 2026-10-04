@@ -414,127 +414,199 @@ def sigmoid(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def calculate_final(seq, session_id, state):
-    """Ensemble 4 lớp, có hiệu chỉnh lệch Tài/Xỉu.
+def _hmm_probability(sig):
+    """Chuyển tín hiệu HMM rời rạc thành xác suất đối xứng."""
+    if sig > 0:
+        return 0.68
+    if sig < 0:
+        return 0.32
+    return 0.50
 
-    Giữ nguyên Bayesian + HMM + Bandit + bộ lọc entropy/regime,
-    đồng thời dùng Markov làm tín hiệu chuyển trạng thái thay cho MD5.
-    Điểm quan trọng: không cho một tín hiệu Tài đơn lẻ kéo cả ensemble
-    sang Tài khi tỷ lệ thực tế gần đây đang nghiêng về Xỉu.
+
+def _expert_probabilities(seq):
+    """Các xác suất dự báo độc lập; không dùng kết quả tương lai."""
+    if not seq:
+        return {"bayes": 0.5, "hmm": 0.5, "markov": 0.5}
+
+    p_bayes = BayesianModel().probability(seq)
+    hmm_sig = HMMModel().predict(seq)
+    p_hmm = _hmm_probability(hmm_sig)
+    p_markov = MarkovModel().probability(seq)
+    return {
+        "bayes": clamp(p_bayes, 0.08, 0.92),
+        "hmm": clamp(p_hmm, 0.08, 0.92),
+        "markov": clamp(p_markov, 0.08, 0.92),
+    }
+
+
+def _log_loss(p, actual):
+    p = clamp(float(p), 0.02, 0.98)
+    return -(math.log(p) if actual == 1 else math.log(1.0 - p))
+
+
+def _walk_forward_weights(seq, bandit):
+    """Học trọng số bằng walk-forward, tuyệt đối không nhìn trước kết quả.
+
+    Với tối đa 200 phiên, đây phù hợp hơn việc cố định trọng số vì mỗi
+    mô hình được đánh giá trên chính khả năng dự báo phiên kế tiếp của nó.
+    """
+    n = len(seq)
+    if n < 20:
+        return {name: bandit.weight(name) for name in ("bayes", "hmm", "markov")}
+
+    start = max(12, n - 100)
+    losses = {name: 0.0 for name in ("bayes", "hmm", "markov")}
+    counts = 0
+
+    for i in range(start, n):
+        prefix = seq[:i]
+        if len(prefix) < 8:
+            continue
+        probs = _expert_probabilities(prefix)
+        actual = seq[i]
+        for name, p in probs.items():
+            losses[name] += _log_loss(p, actual)
+        counts += 1
+
+    if counts == 0:
+        return {name: bandit.weight(name) for name in losses}
+
+    # Softmax nghịch đảo log-loss: model nào dự báo tốt hơn sẽ có trọng số
+    # lớn hơn, nhưng không thể chiếm toàn bộ ensemble.
+    avg = {name: losses[name] / counts for name in losses}
+    raw = {}
+    for name, loss in avg.items():
+        raw[name] = math.exp(-2.2 * loss) * bandit.weight(name)
+
+    total = sum(raw.values()) or 1.0
+    weights = {name: raw[name] / total for name in raw}
+
+    # Floor/ceiling để một mô hình không chết hẳn hoặc áp đảo 2 mô hình kia.
+    weights = {name: clamp(w, 0.16, 0.56) for name, w in weights.items()}
+    total = sum(weights.values()) or 1.0
+    return {name: weights[name] / total for name in weights}
+
+
+def calculate_final(seq, session_id, state):
+    """Ensemble thích nghi cho Tài/Xỉu trên tối đa 200 phiên.
+
+    Giữ Bayesian + HMM + Bandit + entropy/regime; MD5 đã bỏ.
+    Markov là thuật toán bổ sung. Trọng số được học bằng walk-forward,
+    nên không mặc định thiên Tài hay Xỉu.
     """
     del session_id
 
-    bayes = BayesianModel()
-    hmm = HMMModel()
-    markov = MarkovModel()
-    bandit = Bandit(state)
-
     n = len(seq)
-    caution = chaos_block(seq)
+    if not seq:
+        return {
+            "final": "XỈU", "confidence": 50.0,
+            "tai_probability": 50.0, "xiu_probability": 50.0,
+            "score": 0.0, "caution": True, "history_used": 0,
+        }
 
-    p_bayes = bayes.probability(seq)
-    hmm_sig = hmm.predict(seq)
-    p_markov = markov.probability(seq)
+    bandit = Bandit(state)
+    probs = _expert_probabilities(seq)
+    weights = _walk_forward_weights(seq, bandit)
 
-    w_bayes = bandit.weight("bayes")
-    w_hmm = bandit.weight("hmm")
-    w_markov = bandit.weight("markov")
-
-    # Tín hiệu liên tục của Bayesian + Markov.
-    bayes_score = (p_bayes - 0.5) * 2.0
-    markov_score = (p_markov - 0.5) * 2.0
-    hmm_score = float(hmm_sig)
-
-    total_w = w_bayes + w_markov + w_hmm
-    if total_w <= 0:
-        total_w = 1.0
-
-    ensemble = (
-        bayes_score * w_bayes
-        + markov_score * w_markov
-        + hmm_score * w_hmm
-    ) / total_w
+    # Ensemble hiện tại.
+    p_model = sum(probs[name] * weights[name] for name in probs)
 
     # --------------------------------------------------------
-    # 1) BASE-RATE CALIBRATION
+    # BASE RATE ĐỐI XỨNG
     # --------------------------------------------------------
-    # Neo mô hình theo tỷ lệ thật của 30/80 phiên gần nhất.
-    # Đây là phần chống lỗi "toàn Tài" khi dữ liệu thực tế đang nghiêng Xỉu.
-    recent_n = min(30, n)
+    # Chỉ là prior yếu. Không cho tỷ lệ Tài cũ kéo xác suất về Tài mãi.
+    recent_n = min(24, n)
     mid_n = min(80, n)
-    recent_rate = sum(seq[-recent_n:]) / recent_n if recent_n else 0.5
-    mid_rate = sum(seq[-mid_n:]) / mid_n if mid_n else 0.5
-    global_rate = sum(seq) / n if n else 0.5
+    recent_rate = sum(seq[-recent_n:]) / recent_n
+    mid_rate = sum(seq[-mid_n:]) / mid_n
+    global_rate = sum(seq) / n
 
-    # Cửa sổ gần đây được ưu tiên nhưng không bỏ qua 200 phiên.
-    base_rate = 0.55 * recent_rate + 0.30 * mid_rate + 0.15 * global_rate
-    base_score = (base_rate - 0.5) * 2.0
-
-    # Neo nhẹ về base-rate. Khi base-rate Xỉu, tín hiệu Tài phải có
-    # bằng chứng đủ mạnh mới vượt 50%.
-    ensemble = 0.72 * ensemble + 0.28 * base_score
+    base_rate = 0.50 * recent_rate + 0.30 * mid_rate + 0.20 * global_rate
+    # Shrink mạnh về 50%, đặc biệt quan trọng khi 200 phiên có lệch ngẫu nhiên.
+    base_rate = 0.50 + (base_rate - 0.50) * 0.35
 
     # --------------------------------------------------------
-    # 2) MOMENTUM NHỎ, KHÔNG ĐƯỢC ÁP ĐẢO
+    # RUN/STREAK CHECK
     # --------------------------------------------------------
-    momentum_n = min(12, n)
-    momentum_rate = sum(seq[-momentum_n:]) / momentum_n if momentum_n else 0.5
-    momentum = (momentum_rate - 0.5) * 0.18
+    # Không mặc định "bệt thì tiếp tục". Kiểm tra lịch sử các vị trí có
+    # cùng streak và xem cửa tiếp theo thực sự là gì.
+    last = seq[-1]
+    streak = 1
+    while streak < n and seq[-1 - streak] == last:
+        streak += 1
+
+    streak_p = 0.50
+    if streak >= 2:
+        hits = total = 0
+        for i in range(streak, n):
+            if seq[i-streak:i] == [last] * streak:
+                total += 1
+                hits += seq[i]
+        if total:
+            streak_p = (hits + 2.0) / (total + 4.0)
+
+    # Khi streak dài nhưng lịch sử không ủng hộ tiếp diễn, giảm p tương ứng.
+    if streak >= 3:
+        p_model = 0.72 * p_model + 0.28 * streak_p
 
     # --------------------------------------------------------
-    # 3) ANTI-BIAS GUARD
+    # LOGIT BLEND - Đối xứng quanh 50%
     # --------------------------------------------------------
-    # Nếu ensemble nghiêng Tài nhưng dữ liệu gần đây nghiêng Xỉu,
-    # giảm mạnh độ lệch. Ngược lại cũng áp dụng đối xứng cho Xỉu.
-    disagreement = abs(ensemble - base_score)
-    if disagreement > 0.32:
-        ensemble = 0.62 * ensemble + 0.38 * base_score
+    def logit(p):
+        p = clamp(p, 0.03, 0.97)
+        return math.log(p / (1.0 - p))
 
-    score = ensemble * 2.0 + momentum
+    # Model là nguồn chính; base-rate chỉ 20%.
+    blended_logit = 0.80 * logit(p_model) + 0.20 * logit(base_rate)
+    p = sigmoid(blended_logit)
 
-    # Dữ liệu ít -> bảo thủ.
-    if n < 12:
-        score *= 0.45
-    elif n < 25:
-        score *= 0.72
+    # Khi dữ liệu ngắn, co xác suất về 50%.
+    if n < 20:
+        shrink = 0.60
+    elif n < 40:
+        shrink = 0.78
+    else:
+        shrink = 0.90
+    p = 0.50 + (p - 0.50) * shrink
 
-    # Khi chuỗi có entropy cao, giảm confidence.
+    # Entropy/regime chỉ giảm độ tự tin, không đẩy về Tài/Xỉu.
+    caution = chaos_block(seq)
     if caution:
-        score *= 0.58
+        p = 0.50 + (p - 0.50) * 0.55
 
-    prob_tai = sigmoid(score)
+    # Nếu các expert bất đồng mạnh, giảm độ tự tin.
+    disagreement = max(probs.values()) - min(probs.values())
+    if disagreement > 0.38:
+        p = 0.50 + (p - 0.50) * 0.72
 
-    # --------------------------------------------------------
-    # 4) SYMMETRIC CONFIDENCE CAP
-    # --------------------------------------------------------
-    # Không cho bên nào (Tài/Xỉu) được ưu ái. Cap đối xứng.
-    max_conf = 0.82 if caution else 0.86
-    prob_tai = 0.5 + (prob_tai - 0.5) * (max_conf - 0.5) / 0.5
-    prob_tai = clamp(prob_tai, 1.0 - max_conf, max_conf)
+    # Cap đối xứng.
+    max_conf = 0.80 if caution else 0.84
+    p = clamp(p, 1.0 - max_conf, max_conf)
 
-    final = "TÀI" if prob_tai >= 0.5 else "XỈU"
-    confidence = round(max(prob_tai, 1.0 - prob_tai) * 100.0, 2)
+    final = "TÀI" if p >= 0.5 else "XỈU"
+    confidence = max(p, 1.0 - p) * 100.0
+    hmm_sig = HMMModel().predict(seq)
 
     return {
         "final": final,
-        "confidence": confidence,
-        "tai_probability": round(prob_tai * 100.0, 2),
-        "xiu_probability": round((1.0 - prob_tai) * 100.0, 2),
-        "score": round(score, 6),
+        "confidence": round(confidence, 2),
+        "tai_probability": round(p * 100.0, 2),
+        "xiu_probability": round((1.0 - p) * 100.0, 2),
+        "score": round(logit(p), 6),
         "caution": caution,
-        "bayesian_probability": round(p_bayes * 100.0, 2),
-        "markov_probability": round(p_markov * 100.0, 2),
+        "bayesian_probability": round(probs["bayes"] * 100.0, 2),
+        "hmm_probability": round(probs["hmm"] * 100.0, 2),
         "hmm_signal": hmm_sig,
-        "bandit": bandit.export(),
+        "markov_probability": round(probs["markov"] * 100.0, 2),
+        "expert_weights": {k: round(v, 4) for k, v in weights.items()},
         "recent_tai_rate": round(recent_rate * 100.0, 2),
         "mid_tai_rate": round(mid_rate * 100.0, 2),
         "global_tai_rate": round(global_rate * 100.0, 2),
         "calibration_base_tai": round(base_rate * 100.0, 2),
-        "entropy": round(
-            entropy(seq, min(30, max(20, len(seq))))
-            if len(seq) >= 20 else 0.0,
-            6,
-        ),
+        "streak": streak,
+        "streak_probability_tai": round(streak_p * 100.0, 2),
+        "expert_disagreement": round(disagreement, 6),
+        "entropy": round(entropy(seq, min(30, max(20, len(seq)))) if len(seq) >= 20 else 0.0, 6),
         "regime_strength": round(regime_strength(seq), 6),
         "history_used": min(n, MAX_HISTORY),
     }
@@ -750,14 +822,9 @@ def build_prediction_for_current_history():
     if not history:
         return None
 
-    # Không cần tạo trùng nếu đã có dự đoán cho session kế tiếp.
-    next_session = int(history[-1]["session"]) + 1
-    predictions = load_predictions()
-
-    existing = predictions.get(str(next_session))
-    if existing and not existing.get("evaluated", False):
-        return existing
-
+    # Luôn tính lại dự đoán cho phiên kế tiếp từ history hiện tại.
+    # Không trả lại prediction cũ chưa được đánh giá: sau khi thay thuật toán
+    # hoặc sau khi history thay đổi, kết quả phải phản ánh model mới ngay.
     return create_prediction(history)
 
 
