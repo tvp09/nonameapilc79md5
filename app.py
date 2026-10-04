@@ -32,9 +32,9 @@ STATE_FILE = DATA_DIR / "model_state.json"
 PREDICTIONS_FILE = DATA_DIR / "predictions.json"
 
 app = FastAPI(
-    title="Tai Xiu Prediction API",
+    title="Tai Xiu Analysis API",
     version="1.0.0",
-    description="Render API trung gian: lấy dữ liệu, lưu 200 phiên và dự đoán Tài/Xỉu.",
+    description="Render API trung gian: lấy dữ liệu, lưu 200 phiên và phân tích Tài/Xỉu.",
 )
 
 app.add_middleware(
@@ -415,7 +415,14 @@ def sigmoid(x):
 
 
 def calculate_final(seq, session_id, state):
-    del session_id  # Không dùng ID phiên để tạo tín hiệu giả.
+    """Ensemble 4 lớp, có hiệu chỉnh lệch Tài/Xỉu.
+
+    Giữ nguyên Bayesian + HMM + Bandit + bộ lọc entropy/regime,
+    đồng thời dùng Markov làm tín hiệu chuyển trạng thái thay cho MD5.
+    Điểm quan trọng: không cho một tín hiệu Tài đơn lẻ kéo cả ensemble
+    sang Tài khi tỷ lệ thực tế gần đây đang nghiêng về Xỉu.
+    """
+    del session_id
 
     bayes = BayesianModel()
     hmm = HMMModel()
@@ -448,30 +455,61 @@ def calculate_final(seq, session_id, state):
         + hmm_score * w_hmm
     ) / total_w
 
-    # Động lượng gần đây chỉ là bộ hiệu chỉnh nhỏ, không áp đảo ensemble.
-    recent_n = min(12, n)
-    recent_rate = sum(seq[-recent_n:]) / recent_n
-    momentum = (recent_rate - 0.5) * 0.35
+    # --------------------------------------------------------
+    # 1) BASE-RATE CALIBRATION
+    # --------------------------------------------------------
+    # Neo mô hình theo tỷ lệ thật của 30/80 phiên gần nhất.
+    # Đây là phần chống lỗi "toàn Tài" khi dữ liệu thực tế đang nghiêng Xỉu.
+    recent_n = min(30, n)
+    mid_n = min(80, n)
+    recent_rate = sum(seq[-recent_n:]) / recent_n if recent_n else 0.5
+    mid_rate = sum(seq[-mid_n:]) / mid_n if mid_n else 0.5
+    global_rate = sum(seq) / n if n else 0.5
 
-    score = ensemble * 2.25 + momentum
+    # Cửa sổ gần đây được ưu tiên nhưng không bỏ qua 200 phiên.
+    base_rate = 0.55 * recent_rate + 0.30 * mid_rate + 0.15 * global_rate
+    base_score = (base_rate - 0.5) * 2.0
 
-    # Dữ liệu quá ít: confidence bảo thủ.
+    # Neo nhẹ về base-rate. Khi base-rate Xỉu, tín hiệu Tài phải có
+    # bằng chứng đủ mạnh mới vượt 50%.
+    ensemble = 0.72 * ensemble + 0.28 * base_score
+
+    # --------------------------------------------------------
+    # 2) MOMENTUM NHỎ, KHÔNG ĐƯỢC ÁP ĐẢO
+    # --------------------------------------------------------
+    momentum_n = min(12, n)
+    momentum_rate = sum(seq[-momentum_n:]) / momentum_n if momentum_n else 0.5
+    momentum = (momentum_rate - 0.5) * 0.18
+
+    # --------------------------------------------------------
+    # 3) ANTI-BIAS GUARD
+    # --------------------------------------------------------
+    # Nếu ensemble nghiêng Tài nhưng dữ liệu gần đây nghiêng Xỉu,
+    # giảm mạnh độ lệch. Ngược lại cũng áp dụng đối xứng cho Xỉu.
+    disagreement = abs(ensemble - base_score)
+    if disagreement > 0.32:
+        ensemble = 0.62 * ensemble + 0.38 * base_score
+
+    score = ensemble * 2.0 + momentum
+
+    # Dữ liệu ít -> bảo thủ.
     if n < 12:
-        score *= 0.55
+        score *= 0.45
     elif n < 25:
-        score *= 0.78
+        score *= 0.72
 
-    # Khi chaos cao, giảm tác động.
+    # Khi chuỗi có entropy cao, giảm confidence.
     if caution:
-        score *= 0.62
+        score *= 0.58
 
     prob_tai = sigmoid(score)
 
-    # Không cho mô hình giả vờ chắc chắn 99% với chỉ 200 phiên.
-    max_conf = 0.82 if caution else 0.88
-    prob_tai = 0.5 + (prob_tai - 0.5) * (
-        max_conf - 0.5
-    ) / 0.5
+    # --------------------------------------------------------
+    # 4) SYMMETRIC CONFIDENCE CAP
+    # --------------------------------------------------------
+    # Không cho bên nào (Tài/Xỉu) được ưu ái. Cap đối xứng.
+    max_conf = 0.82 if caution else 0.86
+    prob_tai = 0.5 + (prob_tai - 0.5) * (max_conf - 0.5) / 0.5
     prob_tai = clamp(prob_tai, 1.0 - max_conf, max_conf)
 
     final = "TÀI" if prob_tai >= 0.5 else "XỈU"
@@ -488,6 +526,10 @@ def calculate_final(seq, session_id, state):
         "markov_probability": round(p_markov * 100.0, 2),
         "hmm_signal": hmm_sig,
         "bandit": bandit.export(),
+        "recent_tai_rate": round(recent_rate * 100.0, 2),
+        "mid_tai_rate": round(mid_rate * 100.0, 2),
+        "global_tai_rate": round(global_rate * 100.0, 2),
+        "calibration_base_tai": round(base_rate * 100.0, 2),
         "entropy": round(
             entropy(seq, min(30, max(20, len(seq))))
             if len(seq) >= 20 else 0.0,
@@ -800,7 +842,7 @@ def check_api_key(x_api_key: str | None):
 async def root():
     return {
         "success": True,
-        "name": "Tai Xiu Prediction API",
+        "name": "Tai Xiu Analysis API",
         "admin": ADMIN,
         "endpoints": [
             "/api/status",
