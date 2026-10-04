@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: sicbo-prediction-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ADMIN
+        value: noname
+      - key: POLL_SECONDS
+        value: "5"
+      - key: API_KEY
+        sync: false
+      - key: SOURCE_API
+        value: "https://wtxmd52.tele68.com/v1/txmd5/lite-sessions?cp=R&cl=R&pf=web&at=6256356b3f81d9bd5e0950ecd13c7df0"
