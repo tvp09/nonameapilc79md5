@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import hashlib
 import asyncio
 from pathlib import Path
 from collections import defaultdict
@@ -32,9 +33,9 @@ STATE_FILE = DATA_DIR / "model_state.json"
 PREDICTIONS_FILE = DATA_DIR / "predictions.json"
 
 app = FastAPI(
-    title="Tai Xiu Analysis API",
+    title="Sic Bo Prediction API",
     version="1.0.0",
-    description="Render API trung gian: lấy dữ liệu, lưu 200 phiên và phân tích Tài/Xỉu.",
+    description="Render API trung gian: lấy dữ liệu, lưu 200 phiên và dự đoán Tài/Xỉu.",
 )
 
 app.add_middleware(
@@ -87,7 +88,7 @@ def load_state():
             "bandit": {
                 "bayes": 1.0,
                 "hmm": 1.0,
-                "markov": 1.0,
+                "md5": 1.0,
             },
             "accuracy": {
                 "total": 0,
@@ -117,246 +118,81 @@ def save_predictions(predictions):
 
 
 # ============================================================
-# ALGORITHM ENGINE - TÀI/XỈU ENSEMBLE
+# ALGORITHM ENGINE
 # ============================================================
-#
-# 4 thành phần hiện có được GIỮ và nâng cấp:
-#   1) BayesianModel  -> Bayesian thích nghi theo độ mới.
-#   2) HMMModel       -> HMM/pattern state, chuyển trạng thái + streak.
-#   3) Bandit         -> tự điều chỉnh trọng số theo kết quả thực tế.
-#   4) entropy/chaos  -> phát hiện regime/nhiễu để giảm confidence.
-#
-# MD5 prediction đã được LOẠI BỎ vì mã phiên không phải tín hiệu thống kê
-# đáng tin cậy cho kết quả Tài/Xỉu.
-#
-# Thuật toán mới thay MD5:
-#   MarkovModel -> học xác suất chuyển Tài/Xỉu bậc 1 và bậc 2.
-#
-# Tất cả mô hình chỉ dùng tối đa 200 phiên đang lưu, không tạo dữ liệu giả.
-# ============================================================
-
-def clamp(value, low, high):
-    return max(low, min(high, value))
-
-
-def weighted_rate(seq, decay=0.965):
-    """Tỷ lệ Tài có trọng số, phiên mới quan trọng hơn phiên cũ."""
-    if not seq:
-        return 0.5
-
-    weight = 1.0
-    tai_weight = 0.0
-    total_weight = 0.0
-
-    for value in reversed(seq):
-        total_weight += weight
-        tai_weight += value * weight
-        weight *= decay
-
-    return tai_weight / total_weight if total_weight else 0.5
-
 
 class BayesianModel:
-    """Bayesian thích nghi: prior + tỷ lệ toàn cục + tỷ lệ gần đây."""
-
     def probability(self, seq):
-        if not seq:
-            return 0.5
-
-        n = len(seq)
-
-        # Prior yếu, tránh 200 phiên Tài/Xỉu làm mô hình quá cực đoan.
-        alpha = 2.0
-        beta = 2.0
-
-        # Toàn bộ cửa sổ nhưng giảm dần theo độ cũ.
-        decay = 0.975
-        weight = 1.0
-        for value in reversed(seq):
-            if value == 1:
-                alpha += weight
+        # Rebuild từ lịch sử để không bị cộng lặp sau restart.
+        alpha = 1.0
+        beta = 1.0
+        for result in seq:
+            if result == 1:
+                alpha += 1
             else:
-                beta += weight
-            weight *= decay
-
-        p_global = alpha / (alpha + beta)
-
-        # Cửa sổ ngắn để bắt thay đổi regime.
-        short_n = min(24, n)
-        short = seq[-short_n:]
-        p_short = (2.0 + sum(short)) / (4.0 + short_n)
-
-        # Cửa sổ trung bình ổn định hơn cửa sổ quá ngắn.
-        mid_n = min(80, n)
-        mid = seq[-mid_n:]
-        p_mid = (4.0 + sum(mid)) / (8.0 + mid_n)
-
-        # Nếu dữ liệu ngắn thì ưu tiên toàn cục; dữ liệu đủ 200 thì
-        # tăng trọng số tín hiệu gần đây nhưng vẫn shrink về 50%.
-        if n < 12:
-            p = 0.65 * p_global + 0.35 * p_short
-        elif n < 40:
-            p = 0.45 * p_global + 0.35 * p_mid + 0.20 * p_short
-        else:
-            p = 0.30 * p_global + 0.30 * p_mid + 0.40 * p_short
-
-        # Shrink nhẹ về 50% để chống overfit trên chuỗi ngắn/nhiễu.
-        shrink = 0.08 if n >= 40 else 0.15
-        return clamp(0.5 + (p - 0.5) * (1.0 - shrink), 0.08, 0.92)
+                beta += 1
+        return alpha / (alpha + beta)
 
 
 class HMMModel:
-    """
-    HMM/pattern-state cải tiến.
-    Không giả định bệt luôn tiếp diễn: đánh giá đồng thời
-    streak, chuyển trạng thái và các mẫu gần đây.
-    """
-
     def predict(self, seq):
         if len(seq) < 8:
             return 0
 
-        n = len(seq)
         last = seq[-1]
+        score = 0.0
 
-        # --- State 1: streak ---
+        # Cầu bệt
         streak = 1
-        for i in range(n - 2, -1, -1):
+        for i in range(len(seq) - 2, -1, -1):
             if seq[i] == last:
                 streak += 1
             else:
                 break
 
-        # Xác suất tiếp tục bệt từ các đoạn trong lịch sử có cùng độ dài.
-        continuation = 0.5
-        if streak >= 2:
-            hits = total = 0
-            for i in range(streak, n):
-                if seq[i - streak:i] == [last] * streak:
-                    total += 1
-                    hits += seq[i] == last
-            if total:
-                continuation = (hits + 2.0) / (total + 4.0)
+        if streak >= 4:
+            score += min(1.2, streak * 0.25)
 
-        # --- State 2: nhịp đảo ---
-        alt_len = min(10, n)
-        alt = seq[-alt_len:]
-        alternations = sum(alt[i] != alt[i - 1] for i in range(1, len(alt)))
-        alt_ratio = alternations / max(1, len(alt) - 1)
+        # Cầu đảo đều
+        if seq[-6:] == [1, 0] * 3 or seq[-6:] == [0, 1] * 3:
+            score -= 1.0
 
-        # --- State 3: mẫu cuối 2-4 phiên ---
-        pattern_score = 0.0
-        for k, strength in ((4, 0.45), (3, 0.35), (2, 0.20)):
-            if n <= k:
-                continue
-            pat = tuple(seq[-k:])
-            matches = []
-            for i in range(k, n):
-                if tuple(seq[i-k:i]) == pat:
-                    matches.append(seq[i])
-            if matches:
-                p = (sum(matches) + 2.0) / (len(matches) + 4.0)
-                pattern_score += (p - 0.5) * strength
+        # Cầu gãy
+        recent = seq[-7:-1]
+        if recent.count(last) <= 2:
+            score -= 0.8
 
-        # Chấm điểm về phía Tài.
-        score = 0.0
+        # Nhiễu cao
+        if len(set(seq[-6:])) == 2 and streak <= 2:
+            score *= 0.5
 
-        # Streak chỉ được dùng khi lịch sử thực sự ủng hộ continuation.
-        if streak >= 3:
-            score += clamp((continuation - 0.5) * 4.0, -0.9, 0.9)
-
-        # Chuỗi đảo mạnh thì ưu tiên đảo theo nhịp, nhưng không tuyệt đối.
-        if alt_ratio >= 0.80:
-            score += (-0.55 if last == 1 else 0.55)
-
-        score += pattern_score
-
-        # Nếu đoạn gần nhất cực kỳ cân bằng, giảm tín hiệu HMM.
-        recent = seq[-8:]
-        balance = abs(sum(recent) / len(recent) - 0.5)
-        if balance < 0.125:
-            score *= 0.65
-
-        if score > 0.22:
+        if score > 0.4:
             return 1
-        if score < -0.22:
+        elif score < -0.4:
             return -1
         return 0
 
 
-class MarkovModel:
-    """Thuật toán mới thay MD5: Markov bậc 1 + bậc 2."""
-
-    def probability(self, seq):
-        if len(seq) < 4:
-            return 0.5
-
-        # Bậc 1: P(next | last)
-        counts1 = {
-            0: [1.5, 1.5],  # [xiu, tai]
-            1: [1.5, 1.5],
-        }
-
-        # Bậc 2: P(next | last2)
-        counts2 = defaultdict(lambda: [1.25, 1.25])
-
-        # Ưu tiên các transition gần đây.
-        for i in range(1, len(seq)):
-            context = seq[i - 1]
-            nxt = seq[i]
-            age = len(seq) - 1 - i
-            weight = 0.985 ** age
-            counts1[context][nxt] += weight
-
-            if i >= 2:
-                ctx2 = (seq[i - 2], seq[i - 1])
-                counts2[ctx2][nxt] += weight
-
-        last = seq[-1]
-        c1 = counts1[last]
-        p1 = c1[1] / sum(c1)
-
-        ctx2 = tuple(seq[-2:])
-        c2 = counts2.get(ctx2)
-        p2 = c2[1] / sum(c2) if c2 else p1
-
-        # Mẫu bậc 2 được ưu tiên khi đủ quan sát.
-        p = 0.42 * p1 + 0.58 * p2
-
-        # Shrink để tránh một pattern hiếm làm xác suất nhảy quá mạnh.
-        return clamp(0.5 + (p - 0.5) * 0.78, 0.12, 0.88)
-
-
 class Bandit:
-    """Adaptive ensemble: trọng số dựa trên hiệu quả thực tế."""
-
-    COMPONENTS = ("bayes", "hmm", "markov")
-
     def __init__(self, state):
         b = state.setdefault("bandit", {})
-        self.score = defaultdict(lambda: 1.0)
-
-        for name in self.COMPONENTS:
-            value = float(b.get(name, 1.0))
-            self.score[name] = clamp(value, 0.35, 1.8)
+        self.score = defaultdict(float)
+        for name in ("bayes", "hmm", "md5"):
+            self.score[name] = float(b.get(name, 1.0))
 
     def weight(self, name):
-        return clamp(self.score[name], 0.35, 1.8)
+        return max(0.3, min(1.5, self.score[name]))
 
     def reward(self, name, win):
-        # Learning rate vừa phải để 1 phiên sai không làm mô hình mất niềm tin.
-        old = self.score[name]
+        self.score[name] *= 0.95
         if win:
-            new = old + 0.10 * (1.8 - old)
+            self.score[name] += 0.15
         else:
-            new = old - 0.075 * (old - 0.35)
-
-        # EMA nhẹ chống dao động.
-        self.score[name] = clamp(0.92 * old + 0.08 * new, 0.35, 1.8)
+            self.score[name] -= 0.20
 
     def export(self):
         return {
-            k: round(clamp(float(v), 0.35, 1.8), 6)
+            k: round(max(0.3, min(1.5, float(v))), 6)
             for k, v in self.score.items()
         }
 
@@ -375,365 +211,77 @@ def entropy(seq, w=20):
     return -(p1 * math.log2(p1) + p0 * math.log2(p0))
 
 
-def regime_strength(seq):
-    """
-    Đo mức ổn định của cửa sổ gần đây.
-    Gần 0 = cân bằng/nhiễu; gần 1 = lệch mạnh.
-    Đây là bộ lọc confidence, không tự quyết định kết quả.
-    """
-    if len(seq) < 20:
-        return 0.0
-
-    recent = seq[-20:]
-    balance = abs(sum(recent) / 20.0 - 0.5) * 2.0
-
-    transitions = sum(
-        recent[i] != recent[i - 1]
-        for i in range(1, len(recent))
-    ) / 19.0
-
-    # Transition khoảng 0.5 là trạng thái khó đoán.
-    transition_stability = abs(transitions - 0.5) * 2.0
-
-    return clamp(0.70 * balance + 0.30 * transition_stability, 0.0, 1.0)
-
-
 def chaos_block(seq):
     if len(seq) < 25:
         return False
+    return entropy(seq, 30) > 0.92
 
-    h = entropy(seq, min(30, len(seq)))
-    strength = regime_strength(seq)
 
-    # Entropy cao + regime strength thấp => giảm confidence.
-    return h > 0.96 and strength < 0.25
+def algo_md5(_id, seq_len):
+    md5 = hashlib.md5(str(_id).encode()).hexdigest()
+    sig = 1 if int(md5[-1], 16) < 8 else -1
+
+    if seq_len > 40:
+        sig *= 0.4
+
+    return sig
 
 
 def sigmoid(x):
+    # tránh overflow khi score cực lớn
     x = max(-60.0, min(60.0, x))
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def _hmm_probability(sig):
-    """Chuyển tín hiệu HMM rời rạc thành xác suất đối xứng."""
-    if sig > 0:
-        return 0.68
-    if sig < 0:
-        return 0.32
-    return 0.50
-
-
-def _expert_probabilities(seq):
-    """Các xác suất dự báo độc lập; không dùng kết quả tương lai."""
-    if not seq:
-        return {"bayes": 0.5, "hmm": 0.5, "markov": 0.5}
-
-    p_bayes = BayesianModel().probability(seq)
-    hmm_sig = HMMModel().predict(seq)
-    p_hmm = _hmm_probability(hmm_sig)
-    p_markov = MarkovModel().probability(seq)
-    return {
-        "bayes": clamp(p_bayes, 0.08, 0.92),
-        "hmm": clamp(p_hmm, 0.08, 0.92),
-        "markov": clamp(p_markov, 0.08, 0.92),
-    }
-
-
-def _log_loss(p, actual):
-    p = clamp(float(p), 0.02, 0.98)
-    return -(math.log(p) if actual == 1 else math.log(1.0 - p))
-
-
-def _walk_forward_weights(seq, bandit):
-    """Học trọng số bằng walk-forward, tuyệt đối không nhìn trước kết quả.
-
-    Với tối đa 200 phiên, đây phù hợp hơn việc cố định trọng số vì mỗi
-    mô hình được đánh giá trên chính khả năng dự báo phiên kế tiếp của nó.
-    """
-    n = len(seq)
-    if n < 20:
-        return {name: bandit.weight(name) for name in ("bayes", "hmm", "markov")}
-
-    start = max(12, n - 100)
-    losses = {name: 0.0 for name in ("bayes", "hmm", "markov")}
-    counts = 0
-
-    for i in range(start, n):
-        prefix = seq[:i]
-        if len(prefix) < 8:
-            continue
-        probs = _expert_probabilities(prefix)
-        actual = seq[i]
-        for name, p in probs.items():
-            losses[name] += _log_loss(p, actual)
-        counts += 1
-
-    if counts == 0:
-        return {name: bandit.weight(name) for name in losses}
-
-    # Softmax nghịch đảo log-loss: model nào dự báo tốt hơn sẽ có trọng số
-    # lớn hơn, nhưng không thể chiếm toàn bộ ensemble.
-    avg = {name: losses[name] / counts for name in losses}
-    raw = {}
-    for name, loss in avg.items():
-        raw[name] = math.exp(-2.2 * loss) * bandit.weight(name)
-
-    total = sum(raw.values()) or 1.0
-    weights = {name: raw[name] / total for name in raw}
-
-    # Floor/ceiling để một mô hình không chết hẳn hoặc áp đảo 2 mô hình kia.
-    weights = {name: clamp(w, 0.16, 0.56) for name, w in weights.items()}
-    total = sum(weights.values()) or 1.0
-    return {name: weights[name] / total for name in weights}
-
-
-def _raw_ensemble_probability(seq, weights):
-    """Tính xác suất ensemble trước calibration.
-
-    Hàm này cố ý KHÔNG dùng kết quả tương lai. Nó được dùng cho
-    walk-forward calibration để phát hiện ensemble có bị lệch Tài/Xỉu
-    một cách hệ thống hay không.
-    """
-    probs = _expert_probabilities(seq)
-    p = sum(probs[name] * weights.get(name, 0.0) for name in probs)
-
-    n = len(seq)
-    if n >= 2:
-        last = seq[-1]
-        streak = 1
-        while streak < n and seq[-1 - streak] == last:
-            streak += 1
-
-        # Chỉ dùng streak nếu lịch sử cùng streak có đủ mẫu.
-        if streak >= 3:
-            hits = total = 0
-            for i in range(streak, n):
-                if seq[i-streak:i] == [last] * streak:
-                    total += 1
-                    hits += seq[i]
-            if total >= 3:
-                streak_p = (hits + 2.0) / (total + 4.0)
-                p = 0.82 * p + 0.18 * streak_p
-
-    return clamp(p, 0.05, 0.95)
-
-
-def _walk_forward_calibration(seq, weights, max_points=80):
-    """Đo và sửa bias Tài/Xỉu của chính ensemble.
-
-    Nếu trong các lần dự báo quá khứ ensemble thường cho 65-75% Tài nhưng
-    kết quả thật chỉ khoảng 50%, chỉ tăng/giảm một phía sẽ không đủ. Vì vậy
-    calibration học sai số signed (actual - predicted) và thêm một bộ lọc
-    riêng cho directional bias.
-    """
-    n = len(seq)
-    if n < 30:
-        return {
-            "offset": 0.0,
-            "predicted_tai_rate": 0.5,
-            "actual_tai_rate": sum(seq) / n if n else 0.5,
-            "direction_bias": 0.0,
-            "samples": 0,
-        }
-
-    start = max(12, n - max_points)
-    preds = []
-    actuals = []
-
-    for i in range(start, n):
-        prefix = seq[:i]
-        if len(prefix) < 12:
-            continue
-        preds.append(_raw_ensemble_probability(prefix, weights))
-        actuals.append(seq[i])
-
-    if not preds:
-        return {
-            "offset": 0.0,
-            "predicted_tai_rate": 0.5,
-            "actual_tai_rate": 0.5,
-            "direction_bias": 0.0,
-            "samples": 0,
-        }
-
-    # Weighted recent error: phiên gần đây quan trọng hơn.
-    sw = 0.0
-    signed = 0.0
-    for j, (pred, actual) in enumerate(zip(preds, actuals)):
-        w = 0.985 ** (len(preds) - 1 - j)
-        signed += w * (actual - pred)
-        sw += w
-
-    offset = signed / sw if sw else 0.0
-    predicted_rate = sum(preds) / len(preds)
-    actual_rate = sum(actuals) / len(actuals)
-
-    # Directional bias: tỷ lệ dự đoán Tài (p >= 0.5) so với tỷ lệ Tài thật.
-    predicted_tai_rate = sum(p >= 0.5 for p in preds) / len(preds)
-    direction_bias = actual_rate - predicted_tai_rate
-
-    return {
-        "offset": clamp(offset, -0.18, 0.18),
-        "predicted_tai_rate": predicted_rate,
-        "actual_tai_rate": actual_rate,
-        "direction_bias": clamp(direction_bias, -0.30, 0.30),
-        "samples": len(preds),
-    }
-
-
 def calculate_final(seq, session_id, state):
-    """Ensemble Tài/Xỉu trên tối đa 200 phiên.
-
-    Giữ nguyên 4 nhóm thuật toán hiện có và Markov thay MD5. Điểm quan trọng
-    của bản này là calibration walk-forward: nếu engine có xu hướng chọn Tài
-    quá nhiều trong dữ liệu thực tế, xác suất hiện tại sẽ được kéo lại đối
-    xứng về phía Xỉu. Không ép 50/50 và không giả định phiên kế tiếp phải đảo.
-    """
-    del session_id
+    bayes = BayesianModel()
+    hmm = HMMModel()
+    bandit = Bandit(state)
 
     n = len(seq)
-    if not seq:
-        return {
-            "final": "XỈU", "confidence": 50.0,
-            "tai_probability": 50.0, "xiu_probability": 50.0,
-            "score": 0.0, "caution": True, "history_used": 0,
-        }
-
-    bandit = Bandit(state)
-    probs = _expert_probabilities(seq)
-    weights = _walk_forward_weights(seq, bandit)
-
-    # Ensemble hiện tại.
-    p_model = sum(probs[name] * weights[name] for name in probs)
-
-    # --------------------------------------------------------
-    # BASE RATE ĐỐI XỨNG
-    # --------------------------------------------------------
-    recent_n = min(24, n)
-    mid_n = min(80, n)
-    recent_rate = sum(seq[-recent_n:]) / recent_n
-    mid_rate = sum(seq[-mid_n:]) / mid_n
-    global_rate = sum(seq) / n
-
-    base_rate = 0.50 * recent_rate + 0.30 * mid_rate + 0.20 * global_rate
-    base_rate = 0.50 + (base_rate - 0.50) * 0.25
-
-    # --------------------------------------------------------
-    # RUN/STREAK CHECK
-    # --------------------------------------------------------
-    last = seq[-1]
-    streak = 1
-    while streak < n and seq[-1 - streak] == last:
-        streak += 1
-
-    streak_p = 0.50
-    streak_samples = 0
-    if streak >= 2:
-        hits = total = 0
-        for i in range(streak, n):
-            if seq[i-streak:i] == [last] * streak:
-                total += 1
-                hits += seq[i]
-        streak_samples = total
-        if total:
-            streak_p = (hits + 2.0) / (total + 4.0)
-
-    # Streak dài không được mặc định là tiếp tục.
-    if streak >= 3 and streak_samples >= 3:
-        p_model = 0.80 * p_model + 0.20 * streak_p
-
-    # --------------------------------------------------------
-    # WALK-FORWARD ANTI-BIAS CALIBRATION
-    # --------------------------------------------------------
-    calibration = _walk_forward_calibration(seq, weights)
-
-    # Offset signed là correction chính.
-    p_cal = p_model + 0.72 * calibration["offset"]
-
-    # Nếu engine historically chọn Tài quá thường xuyên so với kết quả thật,
-    # thêm correction directional nhỏ. Làm hoàn toàn đối xứng cho Xỉu.
-    directional_gap = calibration["direction_bias"]
-    p_cal += 0.28 * directional_gap
-
-    # Không cho base-rate kéo quá mạnh về phía nào.
-    p_cal = 0.82 * p_cal + 0.18 * base_rate
-    p_cal = clamp(p_cal, 0.04, 0.96)
-
-    # --------------------------------------------------------
-    # LOGIT BLEND + SHRINK
-    # --------------------------------------------------------
-    def logit(p):
-        p = clamp(p, 0.03, 0.97)
-        return math.log(p / (1.0 - p))
-
-    p = sigmoid(logit(p_cal))
-
-    if n < 20:
-        shrink = 0.55
-    elif n < 40:
-        shrink = 0.75
-    else:
-        shrink = 0.92
-    p = 0.50 + (p - 0.50) * shrink
-
-    # Entropy/regime chỉ giảm confidence, tuyệt đối không đổi hướng.
     caution = chaos_block(seq)
+
+    p_bayes = bayes.probability(seq)
+    hmm_sig = hmm.predict(seq)
+    md5_sig = algo_md5(session_id, n)
+
+    w_bayes = bandit.weight("bayes")
+    w_hmm = bandit.weight("hmm")
+    w_md5 = bandit.weight("md5")
+
+    if n < 25:
+        score = (
+            (p_bayes - 0.5) * 4
+            + hmm_sig * 3 * w_hmm
+            + md5_sig * 2 * w_md5
+        )
+    else:
+        score = (
+            (p_bayes - 0.5) * 6 * w_bayes
+            + hmm_sig * 2 * w_hmm
+            + md5_sig * 1 * w_md5
+        )
+
+    # Khi chaos cao, giảm tác động để confidence không bị thổi phồng.
     if caution:
-        p = 0.50 + (p - 0.50) * 0.50
+        score *= 0.75
 
-    disagreement = max(probs.values()) - min(probs.values())
-    if disagreement > 0.38:
-        p = 0.50 + (p - 0.50) * 0.68
+    prob_tai = sigmoid(score)
+    final = "TÀI" if prob_tai >= 0.5 else "XỈU"
 
-    # --------------------------------------------------------
-    # DIRECTIONAL GUARD
-    # --------------------------------------------------------
-    # Nếu engine đang dự đoán một phía quá thường xuyên nhưng historical
-    # calibration chứng minh phía đó không có lợi thế, kéo thêm một chút.
-    # Guard chỉ kích hoạt khi có >= 30 mẫu, tránh phản ứng với ít dữ liệu.
-    if calibration["samples"] >= 30:
-        pred_rate = calibration["predicted_tai_rate"]
-        actual_rate = calibration["actual_tai_rate"]
-        gap = pred_rate - actual_rate
-        if abs(gap) >= 0.10:
-            p -= 0.20 * gap
-
-    # Cap đối xứng.
-    max_conf = 0.78 if caution else 0.84
-    p = clamp(p, 1.0 - max_conf, max_conf)
-
-    final = "TÀI" if p >= 0.5 else "XỈU"
-    confidence = max(p, 1.0 - p) * 100.0
-    hmm_sig = HMMModel().predict(seq)
-
+    confidence = round(max(prob_tai, 1.0 - prob_tai) * 100.0, 2)
     return {
         "final": final,
-        "confidence": round(confidence, 2),
-        "tai_probability": round(p * 100.0, 2),
-        "xiu_probability": round((1.0 - p) * 100.0, 2),
-        "score": round(logit(p), 6),
+        "confidence": confidence,
+        "tai_probability": round(prob_tai * 100.0, 2),
+        "xiu_probability": round((1.0 - prob_tai) * 100.0, 2),
+        "score": round(score, 6),
         "caution": caution,
-        "bayesian_probability": round(probs["bayes"] * 100.0, 2),
-        "hmm_probability": round(probs["hmm"] * 100.0, 2),
+        "bayesian_probability": round(p_bayes * 100.0, 2),
         "hmm_signal": hmm_sig,
-        "markov_probability": round(probs["markov"] * 100.0, 2),
-        "expert_weights": {k: round(v, 4) for k, v in weights.items()},
-        "recent_tai_rate": round(recent_rate * 100.0, 2),
-        "mid_tai_rate": round(mid_rate * 100.0, 2),
-        "global_tai_rate": round(global_rate * 100.0, 2),
-        "calibration_base_tai": round(base_rate * 100.0, 2),
-        "calibration_offset": round(calibration["offset"] * 100.0, 2),
-        "calibration_predicted_tai_rate": round(calibration["predicted_tai_rate"] * 100.0, 2),
-        "calibration_actual_tai_rate": round(calibration["actual_tai_rate"] * 100.0, 2),
-        "calibration_direction_bias": round(calibration["direction_bias"] * 100.0, 2),
-        "calibration_samples": calibration["samples"],
-        "streak": streak,
-        "streak_probability_tai": round(streak_p * 100.0, 2),
-        "streak_samples": streak_samples,
-        "expert_disagreement": round(disagreement, 6),
+        "md5_signal": md5_sig,
+        "bandit": bandit.export(),
         "entropy": round(entropy(seq, min(30, max(20, len(seq)))) if len(seq) >= 20 else 0.0, 6),
-        "regime_strength": round(regime_strength(seq), 6),
-        "history_used": min(n, MAX_HISTORY),
     }
 
 
@@ -776,7 +324,7 @@ def normalize_result(raw):
 async def fetch_source():
     headers = {
         "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 TaiXiuRenderAPI/2.0",
+        "User-Agent": "Mozilla/5.0 SicBoRenderAPI/1.0",
     }
 
     response = await http_client.get(SOURCE_API, headers=headers)
@@ -871,12 +419,12 @@ def evaluate_predictions(history, state):
         component_signals = pred.get("component_signals", {})
         actual_bit = result_to_bit(actual_result)
 
-        for name in ("bayes", "hmm", "markov"):
+        for name in ("bayes", "hmm", "md5"):
             sig = component_signals.get(name)
             if sig is None:
                 continue
 
-            if name == "bayes" or name == "markov":
+            if name == "bayes":
                 component_pred = "TÀI" if float(sig) >= 50 else "XỈU"
             else:
                 component_pred = "TÀI" if float(sig) > 0 else "XỈU"
@@ -924,7 +472,7 @@ def create_prediction(history):
         "component_signals": {
             "bayes": result["bayesian_probability"],
             "hmm": result["hmm_signal"],
-            "markov": result["markov_probability"],
+            "md5": result["md5_signal"],
         },
         "created_at": datetime.now(timezone.utc).isoformat(),
         "evaluated": False,
@@ -947,9 +495,14 @@ def build_prediction_for_current_history():
     if not history:
         return None
 
-    # Luôn tính lại dự đoán cho phiên kế tiếp từ history hiện tại.
-    # Không trả lại prediction cũ chưa được đánh giá: sau khi thay thuật toán
-    # hoặc sau khi history thay đổi, kết quả phải phản ánh model mới ngay.
+    # Không cần tạo trùng nếu đã có dự đoán cho session kế tiếp.
+    next_session = int(history[-1]["session"]) + 1
+    predictions = load_predictions()
+
+    existing = predictions.get(str(next_session))
+    if existing and not existing.get("evaluated", False):
+        return existing
+
     return create_prediction(history)
 
 
@@ -1034,7 +587,7 @@ def check_api_key(x_api_key: str | None):
 async def root():
     return {
         "success": True,
-        "name": "Tai Xiu Analysis API",
+        "name": "Sic Bo Prediction API",
         "admin": ADMIN,
         "endpoints": [
             "/api/status",
